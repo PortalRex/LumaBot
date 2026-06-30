@@ -30,6 +30,18 @@ You'll need a Discord bot token, a MySQL database, and API keys from Steam and T
    TWITCH_CLIENT_SECRET=<>
    ```
 
+   To enable forum thread auto-close, also set both of these values:
+
+   ```env
+   FORUM_AUTO_CLOSE_CHANNEL_ID=<forum channel id>
+   FORUM_AUTO_CLOSE_TAG_ID=<closed tag id>
+   ```
+
+   Adding the configured closed tag archives and locks the thread. A thread
+   owner, or the author of a thread message, can also react with the check mark
+   emoji to archive and lock the thread, applying the closed tag when the thread
+   has room for another tag.
+
 3. Build and run the Docker image with
 
    ```sh
