@@ -31,6 +31,7 @@ RUN $JAVA_HOME/bin/jlink \
 FROM alpine
 
 WORKDIR /luma
+RUN apk add --no-cache ffmpeg
 RUN mkdir -p web/dist
 COPY --from=web_build /luma/web/dist web/dist
 COPY --from=server_build /luma/server/build/install .
