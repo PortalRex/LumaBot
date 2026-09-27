@@ -1,9 +1,6 @@
 package gq.luma.bot.services;
 
 import gq.luma.bot.Luma;
-
-import java.net.URI;
-import java.net.URL;
 import org.javacord.api.entity.channel.ServerTextChannel;
 import org.javacord.api.entity.message.Message;
 import org.javacord.api.entity.message.Reaction;
@@ -14,9 +11,15 @@ import org.javacord.api.entity.server.Server;
 import org.javacord.api.entity.webhook.IncomingWebhook;
 import org.javacord.api.entity.webhook.Webhook;
 import org.javacord.api.event.message.reaction.SingleReactionEvent;
+import org.javacord.core.DiscordApiImpl;
+import org.javacord.core.entity.message.MessageImpl;
+import org.javacord.core.util.rest.RestEndpoint;
+import org.javacord.core.util.rest.RestMethod;
+import org.javacord.core.util.rest.RestRequest;
 
 import java.awt.*;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 public class PinsService implements Service {
     @Override
@@ -40,12 +43,10 @@ public class PinsService implements Service {
                     // Update its pin count
                     updateMessagePinCount(event, server);
                 } else {
-                    event.requestReaction().thenAccept(reactionOp -> reactionOp.ifPresent(reaction -> {
+                    requestFreshMessage(event).thenAccept(pinnedMessage -> pinnedMessage
+                            .getReactionByEmoji(event.getEmoji()).ifPresent(reaction -> {
                         // Check if it needs to be pinned
                         if (reaction.getCount() >= Luma.database.getServerPinThreshold(server).orElse(Integer.MAX_VALUE)) {
-                            // Pin the message
-                            Message pinnedMessage = event.requestMessage().join();
-
                             Luma.database.getServerPinChannel(server).ifPresent(pinsChannel -> {
                                 IncomingWebhook pinWebhook = pinsChannel.getWebhooks().join().stream()
                                         .filter(Webhook::isIncomingWebhook)
@@ -54,10 +55,7 @@ public class PinsService implements Service {
                                         .findAny().orElseGet(() -> this.createPinWebhook(pinsChannel))
                                         .orElseThrow(AssertionError::new);
 
-                                // This is horrid. `.toWebhookMessageBuilder()` copies all
-                                // message components (including attachments) but the attachment
-                                // URLs are malformed (pngex...). So we have to make our own builder
-                                // and add the attachments ourself.
+                                // Preserve the original filename instead of deriving one from the signed URL.
                                 WebhookMessageBuilder builder = new WebhookMessageBuilder();
 
                                 builder.setDisplayAuthor(pinnedMessage.getAuthor());
@@ -70,28 +68,11 @@ public class PinsService implements Service {
                                 pinnedMessage.getEmbeds().forEach(embed -> {
                                     builder.addEmbed(embed.toBuilder());
                                 });
-                                pinnedMessage.getAttachments().forEach(attachment -> {
-                                    System.out.println("Pinnerino attach URL: " + attachment.getUrl().toString());
-                                    // Remove query/params from the URL (strip everything after '?')
-                                    String raw = attachment.getUrl().toString();
-                                    int q = raw.indexOf('?');
-                                    String cleaned = q >= 0 ? raw.substring(0, q) : raw;
-                                    System.out.println("Pinnerino cleaned URL: " + cleaned);
-                                    try {
-                                        URL cleanedUrl = URI.create(cleaned).toURL();
-                                        builder.addEmbed(new EmbedBuilder()
-                                               .setUrl(cleaned));
-                                        builder.addAttachment(cleanedUrl);
-                                    } catch (Exception e) {
-                                        System.out.println("Pinnerino: Exception: " + e.getMessage());
-                                        builder.addEmbed(new EmbedBuilder()
-                                                .setColor(Color.GRAY)
-                                                .setTitle("Internal Error")
-                                                .setDescription("An error occurred while attaching a file."));
-                                    }
-                                });
+                                pinnedMessage.getAttachments().forEach(attachment -> builder.addAttachment(
+                                        attachment.asByteArray().join(),
+                                        attachment.getFileName(),
+                                        attachment.getDescription().orElse(null)));
 
-                                System.out.println("Pinnerino: Sending pinned message");
                                 Message pinNotification = builder
                                         .addEmbed(new EmbedBuilder()
                                                 .setColor(Color.RED)
@@ -137,6 +118,14 @@ public class PinsService implements Service {
         Bot.api.addMessageEditListener(event -> {
             // TODO: Reflect edited messages in pins
         });
+    }
+
+    private CompletableFuture<Message> requestFreshMessage(SingleReactionEvent event) {
+        return new RestRequest<Message>(Bot.api, RestMethod.GET, RestEndpoint.MESSAGE)
+                .setUrlParameters(Long.toUnsignedString(event.getChannel().getId()),
+                        Long.toUnsignedString(event.getMessageId()))
+                .execute(result -> new MessageImpl((DiscordApiImpl) Bot.api,
+                        event.getChannel(), result.getJsonBody()));
     }
 
     private void updateMessagePinCount(SingleReactionEvent event, Server server) {
