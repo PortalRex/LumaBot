@@ -30,11 +30,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 public class PinsService implements Service {
     private static final Logger logger = LoggerFactory.getLogger(PinsService.class);
+    private final Set<Long> pinningMessages = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Long, Long> unsavedPinNotifications = new ConcurrentHashMap<>();
 
     @Override
     public void startService() {
@@ -54,69 +58,39 @@ public class PinsService implements Service {
             if (Luma.database.ifServerPinEmojiMatches(server, event.getEmoji())) {
                 // Check if the message has already been pinned
                 if(Luma.database.isPinnedMessageNotified(event.getMessageId())) {
+                    unsavedPinNotifications.remove(event.getMessageId());
+                    logger.debug("Pin reaction added to already pinned message {}; updating count.", event.getMessageId());
                     // Update its pin count
                     updateMessagePinCount(event, server);
                 } else {
-                    requestFreshMessage(event).thenAccept(pinnedMessage -> pinnedMessage
-                            .getReactionByEmoji(event.getEmoji()).ifPresent(reaction -> {
-                        // Check if it needs to be pinned
-                        if (reaction.getCount() >= Luma.database.getServerPinThreshold(server).orElse(Integer.MAX_VALUE)) {
-                            Luma.database.getServerPinChannel(server).ifPresent(pinsChannel -> {
-                                IncomingWebhook pinWebhook = pinsChannel.getWebhooks().join().stream()
-                                        .filter(Webhook::isIncomingWebhook)
-                                        .filter(webhook -> webhook.getName().map(name -> name.contains("Luma")).orElse(false))
-                                        .map(Webhook::asIncomingWebhook)
-                                        .findAny().orElseGet(() -> this.createPinWebhook(pinsChannel))
-                                        .orElseThrow(AssertionError::new);
-
-                                // Preserve the original filename instead of deriving one from the signed URL.
-                                WebhookMessageBuilder builder = new WebhookMessageBuilder();
-
-                                builder.setDisplayAuthor(pinnedMessage.getAuthor());
-                                builder.setDisplayAvatar(pinnedMessage.getAuthor().getAvatar());
-                                builder.setDisplayName(pinnedMessage.getAuthor().getDisplayName());
-                                String content = pinnedMessage.getContent() == null ? "" : pinnedMessage.getContent();
-                                boolean hasGifAttachment = pinnedMessage.getAttachments().stream()
-                                        .anyMatch(attachment -> attachment.getFileName().toLowerCase(Locale.ROOT).endsWith(".gif"));
-                                for (Embed embed : pinnedMessage.getEmbeds()) {
-                                    boolean directGifImage = "image".equals(embed.getType()) &&
-                                            (hasGifAttachment || embed.getUrl().map(url -> url.getPath()
-                                                    .toLowerCase(Locale.ROOT).endsWith(".gif")).orElse(false));
-                                    if ("gifv".equals(embed.getType()) || directGifImage) {
-                                        if (hasGifAttachment) {
-                                            // The original GIF is copied from the attachment below.
-                                            continue;
-                                        }
-                                        if (attachGifMedia(builder, embed, pinnedMessage.getId())) {
-                                            String embedUrl = embed.getUrl().map(URL::toString).orElse("");
-                                            if (!embedUrl.isEmpty()) {
-                                                content = content.replace(embedUrl, "").trim();
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    builder.addEmbed(embed.toBuilder());
-                                }
-                                builder.setContent(content);
-                                pinnedMessage.getAttachments().forEach(attachment -> builder.addAttachment(
-                                        attachment.asByteArray().join(),
-                                        attachment.getFileName(),
-                                        attachment.getDescription().orElse(null)));
-
-                                Message pinNotification = builder
-                                        .addEmbed(new EmbedBuilder()
-                                                .setColor(Color.RED)
-                                                .setDescription(reaction.getEmoji().getMentionTag() + " " + reaction.getCount() + " - [Jump!](" + pinnedMessage.getLink().toString() + ")"))
-                                        .setAllowedMentions(new AllowedMentionsBuilder()
-                                                .setMentionEveryoneAndHere(false)
-                                                .setMentionRoles(false)
-                                                .setMentionUsers(false).build())
-                                        .send(pinWebhook).join();
-
-                                Luma.database.createPinNotification(pinnedMessage.getId(), pinNotification.getId());
-                            });
+                    requestFreshMessage(event).thenAccept(pinnedMessage -> {
+                        Optional<Reaction> pinReaction = pinnedMessage.getReactionByEmoji(event.getEmoji());
+                        if (pinReaction.isEmpty()) {
+                            logger.debug("Pin reaction on message {} was gone by the time the message was fetched.",
+                                    event.getMessageId());
+                            return;
                         }
-                    }));
+                        Reaction reaction = pinReaction.get();
+                        int threshold = Luma.database.getServerPinThreshold(server).orElse(Integer.MAX_VALUE);
+                        // Check if it needs to be pinned
+                        if (reaction.getCount() < threshold) {
+                            logger.debug("Message {} has {}/{} pin reactions.", event.getMessageId(),
+                                    reaction.getCount(), threshold);
+                            return;
+                        }
+                        Optional<ServerTextChannel> pinsChannel = Luma.database.getServerPinChannel(server);
+                        if (pinsChannel.isEmpty()) {
+                            logger.warn("Message {} reached the pin threshold in server {} but no pins channel is set.",
+                                    event.getMessageId(), server.getId());
+                            return;
+                        }
+                        logger.info("Message {} reached {}/{} pin reactions in server {}.", event.getMessageId(),
+                                reaction.getCount(), threshold, server.getId());
+                        pinMessageIfNeeded(pinnedMessage, reaction, pinsChannel.get());
+                    }).exceptionally(exception -> {
+                        logger.error("Could not process pin reaction for message {}.", event.getMessageId(), exception);
+                        return null;
+                    });
                 }
             }
         });
@@ -150,12 +124,101 @@ public class PinsService implements Service {
         });
     }
 
-    private CompletableFuture<Message> requestFreshMessage(SingleReactionEvent event) {
+    CompletableFuture<Message> requestFreshMessage(SingleReactionEvent event) {
         return new RestRequest<Message>(Bot.api, RestMethod.GET, RestEndpoint.MESSAGE)
                 .setUrlParameters(Long.toUnsignedString(event.getChannel().getId()),
                         Long.toUnsignedString(event.getMessageId()))
                 .execute(result -> new MessageImpl((DiscordApiImpl) Bot.api,
                         event.getChannel(), result.getJsonBody()));
+    }
+
+    private void pinMessageIfNeeded(Message message, Reaction reaction, ServerTextChannel pinsChannel) {
+        long messageId = message.getId();
+        if (!pinningMessages.add(messageId)) {
+            logger.info("Message {} is already being pinned; skipping duplicate pin.", messageId);
+            return;
+        }
+        try {
+            // Another reaction may have finished pinning while this message was being fetched.
+            if (Luma.database.isPinnedMessageNotified(messageId)) {
+                unsavedPinNotifications.remove(messageId);
+                logger.info("Message {} was pinned by an earlier reaction; skipping duplicate pin.", messageId);
+                return;
+            }
+            Long notificationId = unsavedPinNotifications.get(messageId);
+            if (notificationId == null) {
+                notificationId = sendPinNotification(message, reaction, pinsChannel).getId();
+                logger.info("Posted pin {} for message {} in channel {}.", notificationId, messageId, pinsChannel.getId());
+                // If recording the successful send fails, retry the record without sending again.
+                unsavedPinNotifications.put(messageId, notificationId);
+            } else {
+                logger.info("Retrying save of pin {} for message {} without posting again.", notificationId, messageId);
+            }
+            try {
+                Luma.database.createPinNotification(messageId, notificationId);
+            } catch (RuntimeException exception) {
+                logger.warn("Pin {} for message {} was posted but could not be saved; will retry on the next reaction.",
+                        notificationId, messageId);
+                throw exception;
+            }
+            unsavedPinNotifications.remove(messageId);
+            logger.info("Saved pin {} for message {}.", notificationId, messageId);
+        } finally {
+            pinningMessages.remove(messageId);
+        }
+    }
+
+    Message sendPinNotification(Message pinnedMessage, Reaction reaction, ServerTextChannel pinsChannel) {
+        IncomingWebhook pinWebhook = pinsChannel.getWebhooks().join().stream()
+                .filter(Webhook::isIncomingWebhook)
+                .filter(webhook -> webhook.getName().map(name -> name.contains("Luma")).orElse(false))
+                .map(Webhook::asIncomingWebhook)
+                .findAny().orElseGet(() -> this.createPinWebhook(pinsChannel))
+                .orElseThrow(AssertionError::new);
+
+        // Preserve the original filename instead of deriving one from the signed URL.
+        WebhookMessageBuilder builder = new WebhookMessageBuilder();
+
+        builder.setDisplayAuthor(pinnedMessage.getAuthor());
+        builder.setDisplayAvatar(pinnedMessage.getAuthor().getAvatar());
+        builder.setDisplayName(pinnedMessage.getAuthor().getDisplayName());
+        String content = pinnedMessage.getContent() == null ? "" : pinnedMessage.getContent();
+        boolean hasGifAttachment = pinnedMessage.getAttachments().stream()
+                .anyMatch(attachment -> attachment.getFileName().toLowerCase(Locale.ROOT).endsWith(".gif"));
+        for (Embed embed : pinnedMessage.getEmbeds()) {
+            boolean directGifImage = "image".equals(embed.getType()) &&
+                    (hasGifAttachment || embed.getUrl().map(url -> url.getPath()
+                            .toLowerCase(Locale.ROOT).endsWith(".gif")).orElse(false));
+            if ("gifv".equals(embed.getType()) || directGifImage) {
+                if (hasGifAttachment) {
+                    // The original GIF is copied from the attachment below.
+                    continue;
+                }
+                if (attachGifMedia(builder, embed, pinnedMessage.getId())) {
+                    String embedUrl = embed.getUrl().map(URL::toString).orElse("");
+                    if (!embedUrl.isEmpty()) {
+                        content = content.replace(embedUrl, "").trim();
+                    }
+                    continue;
+                }
+            }
+            builder.addEmbed(embed.toBuilder());
+        }
+        builder.setContent(content);
+        pinnedMessage.getAttachments().forEach(attachment -> builder.addAttachment(
+                attachment.asByteArray().join(),
+                attachment.getFileName(),
+                attachment.getDescription().orElse(null)));
+
+        return builder
+                .addEmbed(new EmbedBuilder()
+                        .setColor(Color.RED)
+                        .setDescription(reaction.getEmoji().getMentionTag() + " " + reaction.getCount() + " - [Jump!](" + pinnedMessage.getLink().toString() + ")"))
+                .setAllowedMentions(new AllowedMentionsBuilder()
+                        .setMentionEveryoneAndHere(false)
+                        .setMentionRoles(false)
+                        .setMentionUsers(false).build())
+                .send(pinWebhook).join();
     }
 
     private boolean attachGifMedia(WebhookMessageBuilder builder, Embed embed, long messageId) {
@@ -252,6 +315,7 @@ public class PinsService implements Service {
         event.requestReaction().thenApply(reactionOp -> reactionOp.map(Reaction::getCount).orElse(0)).thenAccept(count -> {
             updateNumericPinCount(event, server, count);
         }).exceptionally(e -> {
+            logger.warn("Could not update pin count for message {}; setting it to 0.", event.getMessageId(), e);
             updateNumericPinCount(event, server, 0);
             return null;
         });
@@ -276,6 +340,7 @@ public class PinsService implements Service {
     }
 
     private Optional<IncomingWebhook> createPinWebhook(ServerTextChannel textChannel) {
+        logger.info("Creating pin webhook in channel {}.", textChannel.getId());
         return Optional.of(textChannel.createWebhookBuilder()
                 .setName("Luma Pins")
                 .setAvatar(Bot.api.getYourself().getAvatar())

@@ -510,8 +510,7 @@ public class Database implements Service {
                 return rs.next();
             }
         } catch (SQLException e) {
-            e.printStackTrace();
-            return false;
+            throw new IllegalStateException("Could not check pin record for message " + pinnedMessageId, e);
         }
     }
 
@@ -546,7 +545,7 @@ public class Database implements Service {
                 insertPinNotification.execute();
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            throw new IllegalStateException("Could not save pin record for message " + pinnedMessageId, e);
         }
     }
 

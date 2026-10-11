@@ -30,7 +30,8 @@ node/files.properties
 server/tessdata/
 server/out/
 server/build/
-server/src/main/resources/
+server/src/main/resources/*
+!server/src/main/resources/log4j2.xml
 node/out/
 node/build/
 node/src/main/resources/

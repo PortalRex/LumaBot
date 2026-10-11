@@ -17,6 +17,7 @@ repositories {
 }
 
 dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
     implementation 'org.javacord:javacord:3.8.0'
     implementation 'org.javacord:javacord-core:3.8.0'
     implementation 'com.kcthota:emoji4j:6.0'
@@ -35,6 +36,10 @@ dependencies {
     implementation 'com.lukaspradel:steam-web-api:1.11.0'
     implementation group: 'com.fasterxml.jackson.datatype', name: 'jackson-datatype-jsr310', version: '2.12.3'
     implementation group: 'com.github.twitch4j', name: 'twitch4j', version: '1.24.0'
+}
+
+test {
+    useJUnitPlatform()
 }
 
 configurations.each {
